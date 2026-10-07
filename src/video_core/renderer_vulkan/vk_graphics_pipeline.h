@@ -93,6 +93,12 @@ public:
                      bool preloading);
     ~GraphicsPipeline();
 
+    /// Points the pipeline at the live shader infos. Needed after a pipeline was built from
+    /// snapshots on a worker thread.
+    void RebindStages(std::span<const Shader::Info* const, MaxShaderStages> infos) {
+        std::ranges::copy(infos, stages.begin());
+    }
+
     const Shader::Gcn::FetchShaderData& GetFetchShader() const noexcept {
         return fetch_shader;
     }

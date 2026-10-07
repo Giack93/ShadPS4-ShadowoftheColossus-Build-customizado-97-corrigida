@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <future>
 #include <variant>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
@@ -118,6 +120,24 @@ private:
                                    Shader::Backend::Bindings& binding);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
 
+    struct PendingGraphicsPipeline {
+        struct Result {
+            std::unique_ptr<GraphicsPipeline> pipeline;
+            GraphicsPipeline::SerializationSupport sdata;
+        };
+        std::future<Result> future;
+        // Real (live) shader infos of the programs this pipeline was built from.
+        std::array<const Shader::Info*, MaxShaderStages> live_infos{};
+        std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    };
+    static constexpr size_t MaxPendingGraphicsPipelines = 6;
+
+    /// Bookkeeping that must run on the main thread once a new graphics pipeline exists.
+    const GraphicsPipeline* StoreGraphicsPipeline(
+        std::unique_ptr<GraphicsPipeline> pipeline,
+        const GraphicsPipeline::SerializationSupport& sdata, const GraphicsPipelineKey& key,
+        const std::array<vk::ShaderModule, MaxShaderStages>& stage_modules);
+
     [[nodiscard]] bool IsPipelineCacheDirty() const {
         return num_new_pipelines > 0;
     }
@@ -147,6 +167,11 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    bool async_shader_recompiling{};
+    // Must stay the last member: its destructor waits for running workers, which still use the
+    // members above.
+    tsl::robin_map<GraphicsPipelineKey, PendingGraphicsPipeline> pending_graphics_pipelines;
 };
 
 } // namespace Vulkan

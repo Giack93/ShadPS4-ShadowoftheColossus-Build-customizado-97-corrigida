@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <cstdlib>
+#include <optional>
 #include <ranges>
 #include <xxhash.h>
 
@@ -289,6 +291,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes} {
+    async_shader_recompiling = EmulatorSettings.IsAsyncShaderRecompiling();
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
@@ -354,34 +357,125 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
 PipelineCache::~PipelineCache() = default;
 
+const GraphicsPipeline* PipelineCache::StoreGraphicsPipeline(
+    std::unique_ptr<GraphicsPipeline> pipeline, const GraphicsPipeline::SerializationSupport& sdata,
+    const GraphicsPipelineKey& key, const std::array<vk::ShaderModule, MaxShaderStages>& mods) {
+    const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(key);
+    const auto [it, is_new] = graphics_pipelines.try_emplace(key);
+    it.value() = std::move(pipeline);
+
+    RegisterPipelineData(key, pipeline_hash, sdata);
+    ++num_new_pipelines;
+
+    if (EmulatorSettings.IsShaderCollect()) {
+        for (auto stage = 0; stage < MaxShaderStages; ++stage) {
+            if (mods[stage]) {
+                module_related_pipelines[mods[stage]].emplace_back(key);
+            }
+        }
+    }
+    return it->second.get();
+}
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
     if (!RefreshGraphicsKey()) {
         return nullptr;
     }
-    const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
-    if (is_new) {
-        const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
-        LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
-        GraphicsPipeline::SerializationSupport sdata{};
-        it.value() = std::make_unique<GraphicsPipeline>(
-            instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
-            runtime_infos, fetch_shader, modules, sdata, false);
+    if (!async_shader_recompiling) {
+        const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
+        if (is_new) {
+            const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
+            LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
-        RegisterPipelineData(graphics_key, pipeline_hash, sdata);
-        ++num_new_pipelines;
+            GraphicsPipeline::SerializationSupport sdata{};
+            it.value() = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
+                runtime_infos, fetch_shader, modules, sdata, false);
 
-        if (EmulatorSettings.IsShaderCollect()) {
-            for (auto stage = 0; stage < MaxShaderStages; ++stage) {
-                if (infos[stage]) {
-                    auto& m = modules[stage];
-                    module_related_pipelines[m].emplace_back(graphics_key);
+            RegisterPipelineData(graphics_key, pipeline_hash, sdata);
+            ++num_new_pipelines;
+
+            if (EmulatorSettings.IsShaderCollect()) {
+                for (auto stage = 0; stage < MaxShaderStages; ++stage) {
+                    if (infos[stage]) {
+                        auto& m = modules[stage];
+                        module_related_pipelines[m].emplace_back(graphics_key);
+                    }
                 }
             }
         }
+        return it->second.get();
     }
-    return it->second.get();
+
+    // Asynchronous path: the draw is skipped until the pipeline is ready.
+    if (const auto it = graphics_pipelines.find(graphics_key); it != graphics_pipelines.end()) {
+        return it->second.get();
+    }
+
+    if (const auto it = pending_graphics_pipelines.find(graphics_key);
+        it != pending_graphics_pipelines.end()) {
+        auto& pending = it.value();
+        if (pending.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+            return nullptr;
+        }
+        auto result = pending.future.get();
+        const auto live_infos = pending.live_infos;
+        const auto stage_modules = pending.modules;
+        pending_graphics_pipelines.erase(it);
+        result.pipeline->RebindStages(live_infos);
+        return StoreGraphicsPipeline(std::move(result.pipeline), result.sdata, graphics_key,
+                                     stage_modules);
+    }
+
+    if (pending_graphics_pipelines.size() >= MaxPendingGraphicsPipelines) {
+        return nullptr; // Too many compilations in flight, retry on a later draw.
+    }
+
+    const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
+    LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x} asynchronously", pipeline_hash);
+
+    // The live infos are modified on every draw, so the worker gets its own snapshot.
+    PendingGraphicsPipeline pending{};
+    std::array<Shader::Info, MaxShaderStages> info_snapshot{};
+    std::array<const Shader::Info*, MaxShaderStages> snapshot_ptrs{};
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        pending.live_infos[i] = infos[i];
+        pending.modules[i] = modules[i];
+        if (infos[i]) {
+            info_snapshot[i] = *infos[i];
+            snapshot_ptrs[i] = &info_snapshot[i];
+        }
+    }
+    const auto runtime_snapshot = runtime_infos;
+    const auto module_snapshot = modules;
+    std::optional<Shader::Gcn::FetchShaderData> fetch_snapshot;
+    if (fetch_shader) {
+        fetch_snapshot = *fetch_shader;
+    }
+    const auto key_snapshot = graphics_key;
+    const vk::PipelineCache vk_cache = *pipeline_cache;
+
+    pending.future = std::async(
+        std::launch::async,
+        [this, key_snapshot, vk_cache, info_snapshot = std::move(info_snapshot), snapshot_ptrs,
+         runtime_snapshot, module_snapshot,
+         fetch_snapshot = std::move(fetch_snapshot)]() mutable -> PendingGraphicsPipeline::Result {
+            PendingGraphicsPipeline::Result result{};
+            // snapshot_ptrs points into the original array, which was moved into this closure.
+            std::array<const Shader::Info*, MaxShaderStages> local_ptrs{};
+            for (u32 i = 0; i < MaxShaderStages; ++i) {
+                local_ptrs[i] = snapshot_ptrs[i] ? &info_snapshot[i] : nullptr;
+            }
+            result.pipeline = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, key_snapshot, vk_cache, local_ptrs,
+                runtime_snapshot, fetch_snapshot ? &*fetch_snapshot : nullptr, module_snapshot,
+                result.sdata, false);
+            return result;
+        });
+    pending_graphics_pipelines.emplace(graphics_key, std::move(pending));
+    return nullptr;
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {

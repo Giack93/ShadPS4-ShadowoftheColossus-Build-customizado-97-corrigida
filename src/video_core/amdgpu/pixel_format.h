@@ -356,7 +356,9 @@ constexpr NumberConversion MapNumberConversion(const NumberFormat num_fmt,
         case DataFormat::Format16_16_16_16:
             return NumberConversion::Sint16ToSnormNz;
         default:
-            UNREACHABLE_MSG("data_fmt = {}", u32(data_fmt));
+            // Not fatal: stale or garbage descriptors can reach this (e.g. while draws are being
+            // skipped), and aborting the whole emulator is worse than a wrong conversion.
+            return NumberConversion::None;
         }
     }
     default:

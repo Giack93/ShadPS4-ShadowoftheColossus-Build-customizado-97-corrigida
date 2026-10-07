@@ -358,7 +358,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 PipelineCache::~PipelineCache() = default;
 
 const GraphicsPipeline* PipelineCache::StoreGraphicsPipeline(
-    std::unique_ptr<GraphicsPipeline> pipeline, const GraphicsPipeline::SerializationSupport& sdata,
+    std::unique_ptr<GraphicsPipeline> pipeline, GraphicsPipeline::SerializationSupport& sdata,
     const GraphicsPipelineKey& key, const std::array<vk::ShaderModule, MaxShaderStages>& mods) {
     const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(key);
     const auto [it, is_new] = graphics_pipelines.try_emplace(key);

@@ -135,7 +135,7 @@ private:
     /// Bookkeeping that must run on the main thread once a new graphics pipeline exists.
     const GraphicsPipeline* StoreGraphicsPipeline(
         std::unique_ptr<GraphicsPipeline> pipeline,
-        const GraphicsPipeline::SerializationSupport& sdata, const GraphicsPipelineKey& key,
+        GraphicsPipeline::SerializationSupport& sdata, const GraphicsPipelineKey& key,
         const std::array<vk::ShaderModule, MaxShaderStages>& stage_modules);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {

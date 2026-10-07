@@ -169,6 +169,7 @@ private:
         module_related_pipelines;
 
     bool async_shader_recompiling{};
+    bool async_shader_skip_draws{};
     // Must stay the last member: its destructor waits for running workers, which still use the
     // members above.
     tsl::robin_map<GraphicsPipelineKey, PendingGraphicsPipeline> pending_graphics_pipelines;

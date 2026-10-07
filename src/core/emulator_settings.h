@@ -465,6 +465,7 @@ struct VulkanSettings {
     Setting<bool> pipeline_cache_enabled{false};
     Setting<bool> pipeline_cache_archived{false};
     Setting<bool> async_shader_recompiling{true};
+    Setting<bool> async_shader_skip_draws{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -488,6 +489,8 @@ struct VulkanSettings {
                                           &VulkanSettings::pipeline_cache_archived),
             make_override<VulkanSettings>("async_shader_recompiling",
                                           &VulkanSettings::async_shader_recompiling),
+            make_override<VulkanSettings>("async_shader_skip_draws",
+                                          &VulkanSettings::async_shader_skip_draws),
         };
     }
 };
@@ -495,7 +498,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(VulkanSettings, gpu_id, renderdoc_enabled, vk
                                    vkvalidation_core_enabled, vkvalidation_sync_enabled,
                                    vkvalidation_gpu_enabled, vkcrash_diagnostic_enabled,
                                    vkhost_markers, vkguest_markers, pipeline_cache_enabled,
-                                   pipeline_cache_archived, async_shader_recompiling)
+                                   pipeline_cache_archived, async_shader_recompiling,
+                                   async_shader_skip_draws)
 
 // -------------------------------
 // Main manager
@@ -765,6 +769,7 @@ public:
     SETTING_FORWARD_BOOL(m_vulkan, PipelineCacheEnabled, pipeline_cache_enabled)
     SETTING_FORWARD_BOOL(m_vulkan, PipelineCacheArchived, pipeline_cache_archived)
     SETTING_FORWARD_BOOL(m_vulkan, AsyncShaderRecompiling, async_shader_recompiling)
+    SETTING_FORWARD_BOOL(m_vulkan, AsyncShaderSkipDraws, async_shader_skip_draws)
 
 #undef SETTING_FORWARD
 #undef SETTING_FORWARD_BOOL

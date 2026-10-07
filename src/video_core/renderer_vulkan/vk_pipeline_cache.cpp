@@ -292,6 +292,7 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
       desc_heap{instance, scheduler.GetWorkSemaphore(), DescriptorHeapSizes} {
     async_shader_recompiling = EmulatorSettings.IsAsyncShaderRecompiling();
+    async_shader_skip_draws = EmulatorSettings.IsAsyncShaderSkipDraws();
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
         .max_viewport_width = instance.GetMaxViewportWidth(),
@@ -417,8 +418,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
     if (const auto it = pending_graphics_pipelines.find(graphics_key);
         it != pending_graphics_pipelines.end()) {
         auto& pending = it.value();
-        if (pending.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
-            return nullptr;
+        if (async_shader_skip_draws) {
+            if (pending.future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) {
+                return nullptr;
+            }
+        } else {
+            pending.future.wait();
         }
         auto result = pending.future.get();
         const auto live_infos = pending.live_infos;
@@ -475,7 +480,12 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
             return result;
         });
     pending_graphics_pipelines.emplace(graphics_key, std::move(pending));
-    return nullptr;
+    if (async_shader_skip_draws) {
+        return nullptr;
+    }
+    // Safe mode: the draw must not be lost (it may produce a texture the game never redraws), so
+    // wait for the worker and use the pipeline right away.
+    return GetGraphicsPipeline(params);
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {

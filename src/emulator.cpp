@@ -574,6 +574,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
              EmulatorSettings.IsPipelineCacheArchived());
     LOG_INFO(Config, "Vulkan AsyncShaderRecompiling: {}",
              EmulatorSettings.IsAsyncShaderRecompiling());
+    LOG_INFO(Config, "Vulkan AsyncShaderSkipDraws: {}", EmulatorSettings.IsAsyncShaderSkipDraws());
 
     hwinfo::Memory ram;
     hwinfo::OS os;

@@ -148,6 +148,9 @@ jobs:
     runs-on: windows-2025-vs2026
     needs: get-info
     steps:
+    - name: Enable long paths
+      run: git config --system core.longpaths true
+
     - uses: actions/checkout@v6
       with:
         submodules: recursive

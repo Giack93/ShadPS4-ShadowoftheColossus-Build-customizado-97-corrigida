@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <cstdlib>
+#include <optional>
 #include <ranges>
 #include <xxhash.h>
 
@@ -18,6 +20,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_async_pipeline.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_serialization.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -350,14 +353,133 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
+
+    // sotc: background pipeline creation, on by default (SOTC_ASYNC_PIPELINES=0 turns it off).
+    if (AsyncPipelinesEnabled() && instance.IsVertexInputDynamicState()) {
+        const unsigned threads = AsyncPipelineThreadCount();
+        async_compiler = std::make_unique<AsyncPipelineCompiler>(threads);
+        LOG_INFO(Render_Vulkan, "Background graphics pipeline compilation on ({} threads)",
+                 threads);
+    } else {
+        LOG_INFO(Render_Vulkan, "Background graphics pipeline compilation off");
+    }
 }
 
 PipelineCache::~PipelineCache() = default;
 
+// sotc: one graphics pipeline built on a worker. The worker reads only the copies made here on
+// the GPU thread: the stage infos (with their user data and flattened sharps), runtime infos,
+// fetch shader description and module handles. Nothing on that path reads guest memory, as long
+// as vertex input is dynamic state (CanBuildInBackground checks it).
+struct AsyncGraphicsBuild {
+    GraphicsPipelineKey key{};
+    std::array<std::unique_ptr<Shader::Info>, MaxShaderStages> info_copies;
+    std::array<std::vector<u32>, MaxShaderStages> user_data;
+    std::array<const Shader::Info*, MaxShaderStages> infos{};
+    std::array<const Shader::Info*, MaxShaderStages> live_infos{};
+    std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
+    std::array<vk::ShaderModule, MaxShaderStages> modules{};
+    std::optional<Shader::Gcn::FetchShaderData> fetch_shader;
+    GraphicsPipeline::SerializationSupport sdata{};
+    std::unique_ptr<GraphicsPipeline> pipeline;
+    std::string error;
+    std::atomic<bool> done{false};
+};
+
+bool PipelineCache::CanBuildInBackground() const {
+    if (!async_compiler || EmulatorSettings.IsShaderCollect() ||
+        !instance.IsVertexInputDynamicState()) {
+        return false;
+    }
+    // Tessellation and geometry stages read guest memory while the pipeline is built.
+    return !infos[u32(Shader::SwStage::TessellationControl)] &&
+           !infos[u32(Shader::SwStage::TessellationEval)] &&
+           !infos[u32(Shader::SwStage::Geometry)];
+}
+
+void PipelineCache::QueueGraphicsPipeline() {
+    auto build = std::make_shared<AsyncGraphicsBuild>();
+    build->key = graphics_key;
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        if (!infos[i]) {
+            continue;
+        }
+        build->info_copies[i] = std::make_unique<Shader::Info>(*infos[i]);
+        build->user_data[i].assign(infos[i]->user_data.begin(), infos[i]->user_data.end());
+        build->info_copies[i]->user_data = build->user_data[i];
+        build->infos[i] = build->info_copies[i].get();
+        build->live_infos[i] = infos[i];
+    }
+    build->runtime_infos = runtime_infos;
+    build->modules = modules;
+    if (fetch_shader) {
+        build->fetch_shader = *fetch_shader;
+    }
+    const bool queued = async_compiler->Submit([this, build] {
+        try {
+            build->pipeline = std::make_unique<GraphicsPipeline>(
+                instance, scheduler, desc_heap, profile, build->key, *pipeline_cache, build->infos,
+                build->runtime_infos, build->fetch_shader ? &*build->fetch_shader : nullptr,
+                build->modules, build->sdata, false);
+        } catch (const std::exception& e) {
+            build->error = e.what();
+        } catch (...) {
+            build->error = "unknown error";
+        }
+        build->done.store(true, std::memory_order_release);
+    });
+    if (queued) {
+        LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x} in the background",
+                 std::hash<GraphicsPipelineKey>{}(graphics_key));
+        pending_graphics.emplace(graphics_key, std::move(build));
+    }
+}
+
+void PipelineCache::PublishGraphicsPipelines() {
+    for (auto it = pending_graphics.begin(); it != pending_graphics.end();) {
+        auto& build = it.value();
+        if (!build->done.load(std::memory_order_acquire)) {
+            ++it;
+            continue;
+        }
+        const auto& key = it.key();
+        const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(key);
+        if (build->pipeline) {
+            build->pipeline->PublishStages(build->live_infos);
+            RegisterPipelineData(key, pipeline_hash, build->sdata);
+            graphics_pipelines.emplace(key, std::move(build->pipeline));
+            ++num_new_pipelines;
+        } else {
+            // Built on the GPU thread from now on (GetGraphicsPipeline's regular path).
+            LOG_ERROR(Render_Vulkan, "Background compilation of pipeline {:#x} failed: {}",
+                      pipeline_hash, build->error);
+            async_failed.emplace(key, true);
+        }
+        it = pending_graphics.erase(it);
+    }
+}
+
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    if (!pending_graphics.empty()) {
+        PublishGraphicsPipelines();
+    }
     draw_indirect_params = params;
     if (!RefreshGraphicsKey()) {
         return nullptr;
+    }
+    // sotc: a new pipeline is built on a worker and its draws are skipped until it is ready,
+    // instead of stopping the GPU thread for the driver compile (the in-game hitch).
+    if (CanBuildInBackground()) {
+        if (const auto found = graphics_pipelines.find(graphics_key);
+            found != graphics_pipelines.end()) {
+            return found->second.get();
+        }
+        if (!async_failed.contains(graphics_key)) {
+            if (!pending_graphics.contains(graphics_key)) {
+                QueueGraphicsPipeline();
+            }
+            return nullptr;
+        }
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
     if (is_new) {

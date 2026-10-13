@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include <memory>
 #include <variant>
+#include <vector>
 #include <tsl/robin_map.h>
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -37,6 +39,8 @@ namespace Vulkan {
 class Instance;
 class Scheduler;
 class ShaderCache;
+class AsyncPipelineCompiler;
+struct AsyncGraphicsBuild;
 
 struct Program {
     struct Module {
@@ -122,6 +126,11 @@ private:
         return num_new_pipelines > 0;
     }
 
+    /// sotc: background pipeline creation (vk_async_pipeline.h).
+    bool CanBuildInBackground() const;
+    void QueueGraphicsPipeline();
+    void PublishGraphicsPipelines();
+
 private:
     const Instance& instance;
     Scheduler& scheduler;
@@ -147,6 +156,12 @@ private:
     tsl::robin_map<vk::ShaderModule,
                    std::vector<std::variant<GraphicsPipelineKey, ComputePipelineKey>>>
         module_related_pipelines;
+
+    // sotc: graphics pipelines being built on the workers, by key. Declared before the
+    // compiler so that the compiler (whose destructor joins the workers) is destroyed first.
+    tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<AsyncGraphicsBuild>> pending_graphics;
+    tsl::robin_map<GraphicsPipelineKey, bool> async_failed; ///< built on the GPU thread instead
+    std::unique_ptr<AsyncPipelineCompiler> async_compiler;
 };
 
 } // namespace Vulkan

@@ -354,14 +354,17 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
 
-    // sotc: background pipeline creation, on by default (SOTC_ASYNC_PIPELINES=0 turns it off).
-    if (AsyncPipelinesEnabled() && instance.IsVertexInputDynamicState()) {
+    // sotc: background compilation, on by default (SOTC_ASYNC_PIPELINES=0 turns all of it off).
+    if (AsyncPipelinesEnabled()) {
         const unsigned threads = AsyncPipelineThreadCount();
-        async_compiler = std::make_unique<AsyncPipelineCompiler>(threads);
-        LOG_INFO(Render_Vulkan, "Background graphics pipeline compilation on ({} threads)",
-                 threads);
+        async_compiler = std::make_unique<AsyncPipelineCompiler>(threads, 256);
+        LOG_INFO(Render_Vulkan,
+                 "Background compilation on ({} threads): graphics pipelines {}, compute "
+                 "pipelines {}, SPIR-V {}",
+                 threads, instance.IsVertexInputDynamicState() ? "on" : "off (driver)",
+                 AsyncComputeEnabled() ? "on" : "off", AsyncShadersEnabled() ? "on" : "off");
     } else {
-        LOG_INFO(Render_Vulkan, "Background graphics pipeline compilation off");
+        LOG_INFO(Render_Vulkan, "Background compilation off");
     }
 }
 
@@ -385,6 +388,138 @@ struct AsyncGraphicsBuild {
     std::string error;
     std::atomic<bool> done{false};
 };
+
+// sotc: one compute pipeline built on a worker, from a copy of the stage info.
+struct AsyncComputeBuild {
+    ComputePipelineKey key{};
+    std::unique_ptr<Shader::Info> info_copy;
+    std::vector<u32> user_data;
+    const Shader::Info* live_info{};
+    vk::ShaderModule module{};
+    ComputePipeline::SerializationSupport sdata{};
+    std::unique_ptr<ComputePipeline> pipeline;
+    std::string error;
+    std::atomic<bool> done{false};
+};
+
+// sotc: SPIR-V emission and shader module creation of one shader permutation on a worker. The
+// GCN translation (which reads guest memory) is done on the GPU thread first; the worker only
+// reads the IR and this job's copy of the info (flattened user data included).
+struct AsyncShaderBuild {
+    Program* program{};
+    size_t perm_idx{};
+    Shader::Info info;
+    std::vector<u32> user_data;
+    Shader::RuntimeInfo runtime{};
+    Shader::Backend::Bindings binding{};
+    std::unique_ptr<Shader::Pools> pools;
+    std::optional<Shader::IR::Program> ir;
+    std::vector<u32> spv;
+    vk::ShaderModule module{};
+    bool patched{};
+    std::string error;
+    std::atomic<bool> done{false};
+};
+
+namespace {
+/// The binding counters EmitSPIRV advances for a translated stage (see EmitContext::DefineBuffers
+/// and DefineImagesAndSamplers), so the next stage starts at the same place as when emitting here.
+void AdvanceBindings(const Shader::Info& info, Shader::Backend::Bindings& binding) {
+    binding.buffer += static_cast<u32>(info.buffers.size());
+    binding.unified += static_cast<u32>(info.buffers.size() + info.samplers.size());
+    for (const auto& image : info.images) {
+        binding.unified += image.NumBindings(info);
+    }
+}
+} // namespace
+
+bool PipelineCache::CanEmitInBackground(const Shader::Info& info) const {
+    // Vertex and geometry-related stages read guest memory while emitting (fetch shader, copy
+    // shader); fragment and compute shaders only read the info.
+    return async_compiler && AsyncShadersEnabled() && !EmulatorSettings.IsShaderCollect() &&
+           (info.sw_stage == Shader::SwStage::Fragment ||
+            info.sw_stage == Shader::SwStage::Compute);
+}
+
+void PipelineCache::PublishShaders() {
+    for (auto it = pending_shaders.begin(); it != pending_shaders.end();) {
+        auto& build = *it;
+        if (!build->done.load(std::memory_order_acquire)) {
+            ++it;
+            continue;
+        }
+        const auto hash = build->info.pgm_hash;
+        const auto stage = build->info.hw_stage;
+        if (build->module) {
+            DumpShader(build->spv, hash, stage, build->perm_idx, "spv");
+            if (build->patched) {
+                LOG_INFO(Loader, "Loaded patch for {} shader {:#x}", stage, hash);
+            }
+            Vulkan::SetObjectName(instance.GetDevice(), build->module,
+                                  GetShaderName(stage, hash, build->perm_idx));
+            RegisterShaderBinary(std::move(build->spv), hash, build->perm_idx);
+            build->program->modules[build->perm_idx].module = build->module;
+        } else {
+            // The permutation keeps a null module: its draws stay skipped.
+            LOG_ERROR(Render_Vulkan, "Background compilation of {} shader {:#x} failed: {}", stage,
+                      hash, build->error);
+        }
+        it = pending_shaders.erase(it);
+    }
+}
+
+bool PipelineCache::CanBuildComputeInBackground() const {
+    return async_compiler && AsyncComputeEnabled() && !EmulatorSettings.IsShaderCollect();
+}
+
+void PipelineCache::QueueComputePipeline() {
+    auto build = std::make_shared<AsyncComputeBuild>();
+    build->key = compute_key;
+    build->live_info = infos[0];
+    build->info_copy = std::make_unique<Shader::Info>(*infos[0]);
+    build->user_data.assign(infos[0]->user_data.begin(), infos[0]->user_data.end());
+    build->info_copy->user_data = build->user_data;
+    build->module = modules[0];
+    const bool queued = async_compiler->Submit([this, build] {
+        try {
+            build->pipeline = std::make_unique<ComputePipeline>(
+                instance, scheduler, desc_heap, profile, *pipeline_cache, build->key,
+                *build->info_copy, build->module, build->sdata, false);
+        } catch (const std::exception& e) {
+            build->error = e.what();
+        } catch (...) {
+            build->error = "unknown error";
+        }
+        build->done.store(true, std::memory_order_release);
+    });
+    if (queued) {
+        LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x} in the background",
+                 std::hash<ComputePipelineKey>{}(compute_key));
+        pending_compute.emplace(compute_key, std::move(build));
+    }
+}
+
+void PipelineCache::PublishComputePipelines() {
+    for (auto it = pending_compute.begin(); it != pending_compute.end();) {
+        auto& build = it.value();
+        if (!build->done.load(std::memory_order_acquire)) {
+            ++it;
+            continue;
+        }
+        const auto& key = it.key();
+        if (build->pipeline) {
+            build->pipeline->PublishStage(build->live_info);
+            RegisterPipelineData(key, build->sdata);
+            compute_pipelines.emplace(key, std::move(build->pipeline));
+            ++num_new_pipelines;
+        } else {
+            LOG_ERROR(Render_Vulkan, "Background compilation of compute pipeline {:#x} failed: {}",
+                      std::hash<ComputePipelineKey>{}(key), build->error);
+            async_failed_compute.emplace(key, true);
+        }
+        it = pending_compute.erase(it);
+    }
+}
 
 bool PipelineCache::CanBuildInBackground() const {
     if (!async_compiler || EmulatorSettings.IsShaderCollect() ||
@@ -460,6 +595,9 @@ void PipelineCache::PublishGraphicsPipelines() {
 }
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
+    if (!pending_shaders.empty()) {
+        PublishShaders();
+    }
     if (!pending_graphics.empty()) {
         PublishGraphicsPipelines();
     }
@@ -507,8 +645,28 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
 }
 
 const ComputePipeline* PipelineCache::GetComputePipeline() {
+    if (!pending_shaders.empty()) {
+        PublishShaders();
+    }
+    if (!pending_compute.empty()) {
+        PublishComputePipelines();
+    }
     if (!RefreshComputeKey()) {
         return nullptr;
+    }
+    // sotc: like graphics pipelines, a new compute pipeline is built on a worker and its
+    // dispatches are skipped until it is ready (SOTC_ASYNC_COMPUTE=0 turns this off).
+    if (CanBuildComputeInBackground()) {
+        if (const auto found = compute_pipelines.find(compute_key);
+            found != compute_pipelines.end()) {
+            return found->second.get();
+        }
+        if (!async_failed_compute.contains(compute_key)) {
+            if (!pending_compute.contains(compute_key)) {
+                QueueComputePipeline();
+            }
+            return nullptr;
+        }
     }
     const auto [it, is_new] = compute_pipelines.try_emplace(compute_key);
     if (is_new) {
@@ -747,6 +905,12 @@ bool PipelineCache::RefreshGraphicsStages() {
         }
     }
 
+    // sotc: a stage whose SPIR-V is still being emitted in the background has no module yet.
+    for (u32 i = 0; i < MaxShaderStages; ++i) {
+        if (infos[i] && !modules[i]) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -756,18 +920,73 @@ bool PipelineCache::RefreshComputeKey() {
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
     std::tie(infos[0], modules[0], compute_key.value) =
         GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
-    return true;
+    // sotc: null while the shader is still being emitted in the background.
+    return modules[0] != nullptr;
 }
 
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
-                                              Shader::Backend::Bindings& binding) {
+                                              Shader::Backend::Bindings& binding,
+                                              std::shared_ptr<AsyncShaderBuild>* async_out) {
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
 
+    // sotc: translate here, emit SPIR-V and create the module on a worker. Returns a null
+    // module; GetProgram registers the job and PublishShaders fills the module in later.
+    if (async_out && CanEmitInBackground(info)) {
+        auto build = std::make_shared<AsyncShaderBuild>();
+        build->info = info;
+        build->runtime = runtime_info;
+        build->pools = std::make_unique<Shader::Pools>();
+        build->ir.emplace(
+            Shader::TranslateProgram(code, *build->pools, build->info, build->runtime, profile));
+        // The caller gets the translation results exactly as in the synchronous path.
+        info = build->info;
+        runtime_info = build->runtime;
+        build->user_data.assign(build->info.user_data.begin(), build->info.user_data.end());
+        build->info.user_data = build->user_data;
+        build->binding = binding;
+        build->perm_idx = perm_idx;
+        AdvanceBindings(build->info, binding);
+        const bool queued = async_compiler->Submit([this, build] {
+            try {
+                auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, build->runtime, *build->ir,
+                                                             build->binding);
+                build->ir.reset();
+                build->pools.reset();
+                auto patch = GetShaderPatch(build->info.pgm_hash, build->info.hw_stage,
+                                            build->perm_idx, "spv", spv);
+                build->patched = patch && EmulatorSettings.IsPatchShaders();
+                build->module =
+                    CompileSPV(build->patched ? *patch : spv, instance.GetDevice());
+                build->spv = std::move(spv);
+            } catch (const std::exception& e) {
+                build->error = e.what();
+            } catch (...) {
+                build->error = "unknown error";
+            }
+            build->done.store(true, std::memory_order_release);
+        });
+        if (queued) {
+            *async_out = std::move(build);
+            return {};
+        }
+        // Queue full: emit here from the translation already done.
+        binding = build->binding;
+        auto spv =
+            Shader::Backend::SPIRV::EmitSPIRV(profile, build->runtime, *build->ir, binding);
+        return FinishModule(info, code, perm_idx, std::move(spv));
+    }
+
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    return FinishModule(info, code, perm_idx, std::move(spv));
+}
+
+vk::ShaderModule PipelineCache::FinishModule(const Shader::Info& info,
+                                             const std::span<const u32>& code, size_t perm_idx,
+                                             std::vector<u32> spv) {
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
     vk::ShaderModule module;
@@ -801,12 +1020,19 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
-        const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
+        std::shared_ptr<AsyncShaderBuild> async_build;
+        const auto module =
+            CompileModule(program->info, runtime_info, params.code, 0, binding, &async_build);
         auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
         const auto perm_hash = HashCombine(params.hash, 0);
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
         program->AddPermut(module, std::move(spec));
+        if (async_build) {
+            async_build->program = program.get();
+            async_build->perm_idx = 0;
+            pending_shaders.push_back(std::move(async_build));
+        }
         if (auto& fetch = program->modules[0].spec.fetch_shader_data; !fetch.Empty()) {
             fetch_shader = &fetch;
         }
@@ -828,10 +1054,17 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        std::shared_ptr<AsyncShaderBuild> async_build;
+        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding,
+                               &async_build);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));
+        if (async_build) {
+            async_build->program = program.get();
+            async_build->perm_idx = perm_idx;
+            pending_shaders.push_back(std::move(async_build));
+        }
     } else {
         info.AddBindings(binding);
         module = it->module;

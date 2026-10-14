@@ -22,11 +22,33 @@
 
 namespace Vulkan {
 
-/// SOTC_ASYNC_PIPELINES=0 turns background creation off (every new pipeline is built on the
-/// GPU thread, as upstream does: no missing draws, but a hitch per new pipeline).
+/// SOTC_ASYNC_PIPELINES=0 turns all background compilation off (every new shader and pipeline is
+/// built on the GPU thread, as upstream does: nothing skipped, but a hitch per new pipeline).
 inline bool AsyncPipelinesEnabled() {
     static const bool enabled = [] {
         if (const char* v = std::getenv("SOTC_ASYNC_PIPELINES")) {
+            return std::atoi(v) != 0;
+        }
+        return true;
+    }();
+    return enabled;
+}
+
+/// SOTC_ASYNC_COMPUTE=0: compute pipelines are built on the GPU thread again.
+inline bool AsyncComputeEnabled() {
+    static const bool enabled = [] {
+        if (const char* v = std::getenv("SOTC_ASYNC_COMPUTE")) {
+            return std::atoi(v) != 0;
+        }
+        return true;
+    }();
+    return enabled;
+}
+
+/// SOTC_ASYNC_SHADERS=0: SPIR-V of fragment and compute shaders is emitted on the GPU thread again.
+inline bool AsyncShadersEnabled() {
+    static const bool enabled = [] {
+        if (const char* v = std::getenv("SOTC_ASYNC_SHADERS")) {
             return std::atoi(v) != 0;
         }
         return true;

@@ -41,6 +41,8 @@ class Scheduler;
 class ShaderCache;
 class AsyncPipelineCompiler;
 struct AsyncGraphicsBuild;
+struct AsyncComputeBuild;
+struct AsyncShaderBuild;
 
 struct Program {
     struct Module {
@@ -119,7 +121,10 @@ private:
                                                    std::span<const u32> generated);
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
-                                   Shader::Backend::Bindings& binding);
+                                   Shader::Backend::Bindings& binding,
+                                   std::shared_ptr<AsyncShaderBuild>* async_out = nullptr);
+    vk::ShaderModule FinishModule(const Shader::Info& info, const std::span<const u32>& code,
+                                  size_t perm_idx, std::vector<u32> spv);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
@@ -130,6 +135,11 @@ private:
     bool CanBuildInBackground() const;
     void QueueGraphicsPipeline();
     void PublishGraphicsPipelines();
+    bool CanBuildComputeInBackground() const;
+    void QueueComputePipeline();
+    void PublishComputePipelines();
+    bool CanEmitInBackground(const Shader::Info& info) const;
+    void PublishShaders();
 
 private:
     const Instance& instance;
@@ -161,6 +171,9 @@ private:
     // compiler so that the compiler (whose destructor joins the workers) is destroyed first.
     tsl::robin_map<GraphicsPipelineKey, std::shared_ptr<AsyncGraphicsBuild>> pending_graphics;
     tsl::robin_map<GraphicsPipelineKey, bool> async_failed; ///< built on the GPU thread instead
+    tsl::robin_map<ComputePipelineKey, std::shared_ptr<AsyncComputeBuild>> pending_compute;
+    tsl::robin_map<ComputePipelineKey, bool> async_failed_compute;
+    std::vector<std::shared_ptr<AsyncShaderBuild>> pending_shaders;
     std::unique_ptr<AsyncPipelineCompiler> async_compiler;
 };
 
